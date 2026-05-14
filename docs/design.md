@@ -38,6 +38,14 @@ tickforge 生成假的市场数据(orderbook、trade、ticker),用于压测其�
 
 ITCH / MoldUDP64 是 Nasdaq 公开发布的协议规范,可作为 UDP sink 的格式参考。
 
+### 3.1 名词解释:什么是 "WebSocket + JSON sink"
+
+加密货币 CEX(中心化交易所,如 Binance / OKX 这类)对外推送行情的标准方式是 WebSocket:被测系统作为客户端连一个 `wss://...` 地址,服务端持续推送 JSON 格式的 ticker / trade / depth update 消息。
+
+**WS sink 的作用**:让 tickforge 假装成这种 CEX 的 WebSocket 行情服务端。被测系统的客户端代码不用改,把连接地址从真交易所换成 tickforge 就能压测。这是 B 场景(端到端真实表现)里**针对 CEX 用户**的接入形态。
+
+是否做这个 sink、模拟哪家 CEX 的具体 message schema(各家不一样),待定 —— 见 §11。
+
 ## 4. 核心架构:预生成 + 多 Sink + 时序控制
 
 不论选哪个传输,有一个设计原则可以让 tickforge 几乎不可能成为瓶颈——**把"生成逻辑"和"分发"彻底解耦**。
@@ -66,6 +74,23 @@ ITCH / MoldUDP64 是 Nasdaq 公开发布的协议规范,可作为 UDP sink 的�
 - 自带 origin timestamp 和 sequence number
 
 具体 layout 待定,需要在 Sink 接口稳定后再敲。
+
+## 4.3 数据真实度目标
+
+tickforge 生成的事件流应当**看上去比较真实**——被测系统接到的数据在统计特征上应接近真实市场,而不是显然的随机噪声。否则被测系统的某些代码路径(例如 fast-path / slow-path 切换、cache 行为、分支预测)在压测下不会被触发,得出的性能数字没有参考价值。
+
+具体目标:
+
+- **Order book**:维护完整 depth(不仅 top-of-book),level 增 / 删 / 改频率符合真实市场分布
+- **Trade**:size 分布符合长尾(大量小单 + 少量大单),不要均匀分布
+- **价格**:基于几何布朗运动 / mean-reverting 之类的合理过程,而不是纯随机游走
+- **时序**:event 间隔符合真实市场的 burst 模式(开盘 / 收盘 / 大新闻前后密集,平时稀疏)
+
+> 上面是设计意图,具体参数怎么调到"看着真实"还要在生成器实现阶段调试。
+
+**不追求撮合层面的严格自洽**(见 §12 non-goals)——一个 trade 不一定要在 order book 里找到对应的 maker order,只要统计上看着合理即可。
+
+真实度参数(波动率、burst 强度、depth 厚度等)、以及**支持的 symbol 数量与命名**,均通过 runtime config 暴露给使用者。tickforge 本身不预设具体 symbol,使用者按被测系统场景配。
 
 ## 5. Sink 接口
 
@@ -147,11 +172,8 @@ tickforge runner 应内置(或文档化)以下配置:
 
 ## 11. 暂未决定 / 待讨论
 
-- 事件 binary 格式细节(哪些字段、对齐方式、版本兼容)
-- order book 状态机的真实度等级(只动 top-of-book? 全 depth?)
-- 是否需要支持多 symbol / 多 venue 的并发回放
-- WS sink 是模拟某个特定 CEX(如某交易所)还是设计中性接口
-- 是否提供 Python / Rust binding(给非 C++ 被测端用)
+- 事件 binary 格式细节(字段、对齐方式、版本兼容)
+- 是否提供 WebSocket sink、以及模拟哪家 CEX 的 message schema(见 §3.1)
 
 这些等 P0 sink 落地后,根据实际使用反馈再定。
 
@@ -160,3 +182,4 @@ tickforge runner 应内置(或文档化)以下配置:
 - **不做真实撮合引擎**:tickforge 的事件是"看起来合理的假数据",不保证 order book 状态严格自洽到撮合层面。需要真实撮合的场景请用别的工具。
 - **不做行情录制 / 回放真实历史**:那是另一类工具(如 nanomsg-based 录制器)。tickforge 专注于"按需大量生成"。
 - **不做被测系统的 driver / harness**:tickforge 只负责"喷数据",怎么测、测什么由调用方决定。
+- **不提供 Python / Rust binding**:被测端如果不是 C++,通过 SHM ring 或网络 sink 接入,不维护单独的 FFI 层。
